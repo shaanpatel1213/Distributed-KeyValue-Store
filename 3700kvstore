@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+from LogEntry import LogEntry
+
+BROADCAST = "FFFF"
+
+
+# is higher than its own and 2) it receives a request to vote from a candidate where the term in msg is strictly greater than its own
+
+# define int consts for different states of nodes
+LEADER = 0
+FOLLOWER = 1
+CANDIDATE = 2
+
+# NOTE - when using select.select(), make sure that the timeout specified in the function args
+# is not so long that you can't check your "housekeeping tasks" (hearbeats, election timeout, etc.) regularly enough 
+
+# This is how long the select.select() call blocks for
+
+SOCKET_TIMEOUT = 50
+
+# select random number in the range for election timeout for each node
+# TODO - check if these values are ok (too high or too low?)
+ELECTION_TIMEOUT_MIN = 250
+ELECTION_TIMEOUT_MAX = 500
+
+# select random number in the range for heartbeat timeout for each node
+HEARTBEAT_TIMEOUT_MIN = 100
+HEARTBEAT_TIMEOUT_MAX = 200
+
+MAX_MESSAGES_PER_BATCH = 6
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        # set state to follower - everyone should be follower initially
+        self.state = FOLLOWER
+        # current term num as perceived by this machine
+        self.term_num = 0
+        # generate random election timeout time between min and max vals
+        self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+        # generate random hearbeat timeout time between min and max vals
+        self.heartbeat_timeout = random.randint(HEARTBEAT_TIMEOUT_MIN, HEARTBEAT_TIMEOUT_MAX) / 1000.0
+        # every node's a follower initially, so no current leader
+        self.current_leader = BROADCAST
+        # if there's an election and this node is a candidate, this will count number of votes for this node
+        self.num_votes_this_election = 0
+        # time that last event occurred (e.g. heartbeat message was received)
+        self.event_time = 0
+        # whether or not this node has voted during the current term (resets every term)
+        self.voted_for = None
+        # Cache keyValue
+        # contains all of the non-committed key-value-pairs for each replica
+        # global storage, key is replica id, value is dict of entries that need to be added for that replica
+        # e.g. {replica_id: {key: value, key: value, etc.}, ...}
+        self.cache_key_value_pairs = {}
+        # okay messages
+        # NOTE - what is the difference between okayMap and key_value_pairs?
+        # mapping between the 
+        # e.g. {key_of_entry: {src: id, dest: dest, ...} }
+        # (giving back whatever needs to be in the ok value)
+        self.okay_msg_map = {}
+        # Client messages
+        self.clientMessages = []
+        # leader's index immediately preceding the new entries in the append entries
+        #self.prev_log_index = 0
+        # term of entry at prevlogindex
+        #self.prev_log_term = 0
+        # very simple index, just tracks the current index that this log is at 
+        self.current_log_index = 0
+        # index of highest log entry known to be committed
+        self.commit_index = 0
+        # index of highest log entry applied to state machine
+        self.last_applied = 0
+        # the dictionary for this node (holding key-value pairs)
+        self.key_value_pairs = {}
+        # log entries (each element in this list is like a block in the RAFT log diagrams)
+        self.log_entries = []
+        # map of each non-leader replica (all followers) to the index of the next log entry to send to that server
+        self.next_index = {}
+        # map of each non-leader replica (all followers) to the index of the highest log entry known to be replicated on server 
+        self.match_index = {}
+        # for batching - contains all the indices sent by the leader to that replica during the latest append_entries rpc
+        self.indices_for_next_heartbeat = {}
+        for other in self.others:
+            self.next_index.update({other: 1})
+            self.match_index.update({other: 0})
+            # init entries_for_next_heartbeat with other id and empty array for each other id - now, we'll know exactly what indices are being sent
+            self.indices_for_next_heartbeat.update({other: []})
+        
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+
+    # returns the number of total nodes (others plus 1 for this node), divides that number by 2, gets the floor of that number, then adds 1
+    # to get majority required 
+    def num_required_for_majority(self):
+        return math.floor((len(self.others) + 1) / 2) + 1
+
+    def send(self, message):
+        if message is not None:
+            self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+
+    def convert_to_follower(self, message):
+        # convert to follower
+        self.state = FOLLOWER
+        # update term number of this node to whatever the given term number was (prevents voting for more than one candidate in a single term)
+        self.term_num = message.get("term")
+        # new term, so haven't voted yet 
+        self.voted_for = None
+        # reset the timer
+        self.event_time = time.time()
+        # reset vote count
+        self.num_votes_this_election = 0
+        # select new randomized election timeout
+        self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+        print(f"converting to follower, since incoming term > my term, term number {self.term_num}")
+
+    # receive get message
+    def process_get_msg(self, message):
+        # if this node is not the leader, send back with whatever it thinks the leader is (FFFF or the actual leader id)
+        if (self.state != LEADER):
+            print("self.state isn't leader, current_leader = ", self.current_leader)
+            if self.current_leader == BROADCAST:
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "fail", "MID": message.get("MID") }
+            else:
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "redirect", "MID": message.get("MID") }
+        # otherwise, this node is the leader, so get the value for the given key from key_value_pairs (if it exists) and return ok message
+        else:
+            #self.clientMessages.append(message)
+            # get the value at the given key from key_value_pairs
+            requested_value = self.key_value_pairs.get(message.get("key"))
+            #print("&&&&&&&&&&&& performing get, returning value: ", requested_value)
+            # if the given key did not exist in the key_value_pairs (and thus get() returned none), requested_value should be empty string
+            if requested_value is None:
+                requested_value = ""
+            # send back appropriate value
+
+            return { "src": self.id, "dst": message.get("src"), "leader": self.id, "type": "ok", "MID": message.get("MID"), "value": requested_value }
+
+    def process_put_msg_new(self, message):
+        # if this node is not the leader
+        if self.state != LEADER:
+            # check if there is a leader for this node at all (if the election has finished)
+            if self.current_leader == BROADCAST:
+                # if not, return type fail message
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "fail", "MID": message.get("MID") }
+            else:
+                # else, this node has a leader that's not itself, so return redirect message indicating the current leader
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "redirect", "MID": message.get("MID") }
+        # otherwise, this is a leader
+        else:
+            # increment current_log_index
+            self.current_log_index += 1
+            # create log entry (term should just be term number we currently have, since prevLogTerm doesn't matter for leader)
+            # it also stores the command sent by the client
+            # get new key and value from message (new entry)
+            new_key = message.get("key")
+            new_value = message.get("value")
+            # create new log entry with this push, using the current_log_index as the log_index, the leader's term as term num, and the given key_value pair as the "command" that needs to be replicated
+            log_entry = LogEntry(log_index=self.current_log_index, term=self.term_num, command={ new_key: new_value })
+            # add this entry to the log (think of this as adding a new block on the diagram)
+            # NOTE - this is currently uncommitted
+            self.log_entries.append(log_entry)
+            # now, we need to make sure that the okay message that will be sent to the client in the future (once the message is committed and applied to state machine)
+            # we also need to ensure that the MID is maintained
+            
+            # the only identifying information in a log entry is the key-value pair stored in it (as shown above, specifically the command field)
+            # thus, once the leader knows that the entry has been committed and thus wants to send the ok message to the client, it only has the
+            # information in the log entry to go by, and thus we could either store the ok message with the "key from the put" as the key, or
+            # using the "value from the put" as a key with the ok message as a value - we're using the "key from the put here"
+            key_okay_msg_mapping = {new_key: {"src": self.id, "dst": message.get("src"), "leader": self.id, "type": "ok", "MID": message.get("MID")}}
+            print("Storing key_okay_msg_mapping: ", key_okay_msg_mapping)
+            self.okay_msg_map.update(key_okay_msg_mapping)
+            # get log entry as dictionary (this works with the nested dictionary in command too!)
+            #log_entry_as_dict = log_entry.to_dict()
+            # instead of sending here, let's add this to the entries_for_next_heartbeat list
+            #self.entries_for_next_heartbeat.append(log_entry_as_dict)
+            # send the append entries message with the new log entry (which includes the new key-value pair) to followers
+            #self.send_append_entries_msg_from_leader(log_entry_as_dict)
+
+
+
+
+    # receive put msg
+    def process_put_msg(self, message):
+        # if this node is not the leader
+        if self.state != LEADER:
+            # check if there is a leader for this node at all (if the election has finished)
+            if self.current_leader == BROADCAST:
+                # if not, return type fail message
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "fail", "MID": message.get("MID") }
+            else:
+                # else, this node has a leader that's not itself, so return redirect message indicating the current leader
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "redirect", "MID": message.get("MID") }
+        # otherwise, this node is the leader
+        else:
+            # increment prevLogIndex
+            #self.prev_log_index += 1
+            #self.prev_log_term = self.term_num
+            # save message
+            self.clientMessages.append(message)
+            # get the key and value from the put message
+            new_key = message.get("key")
+            new_value = message.get("value")
+            # update key_value_pairs with the new key_value_pair
+            entry = { new_key: new_value}
+            # for all the followers (since we're leader)
+            for other in self.others:
+                # if the follower is in the cache already
+                if other in self.cache_key_value_pairs.keys():
+                    # the key-value pairs that still need to be added to that replica (other)
+                    dict_of_pairs = self.cache_key_value_pairs.pop(other)
+                    # if the dictionary is not empty (there ARE previous key-value pairs to cache apart from the one we just got)
+                    if dict_of_pairs is not None:
+                        # update the dictionary of pairs
+                        dict_of_pairs.update(entry)
+                        self.cache_key_value_pairs.update({other: dict_of_pairs})
+                    # otherwise, this replica currently has no non-committed entries, so we need to init
+                    # the cache dictionary with this new put that we just received
+                    else:
+                        print("this is what I set the list of map to ", entry)
+                        self.cache_key_value_pairs.update({other: entry})
+                else:
+                    #print("this is what I set the list of map to ", entry)
+                    self.cache_key_value_pairs.update({other : entry})
+            # send append entries to everyone with the given key-value pair so that they may commit it eventually
+            self.send_append_entries_msg_from_leader(entry)
+
+            # return ok message
+            # NOTE - what is this doing?
+            # it has to save the src it come from so I just create the whole message needed to send back to the client
+            # NOTE - instead of doing type ok, maybe having append-entries msg with a new field "success" and setting that to true would
+            # be better? the client expects a "ok" message
+            message = {"src": self.id, "dst": message.get("src"), "leader": self.id, "type": "ok", "MID": message.get("MID")}
+            print("added okay message: ", "key: ", new_key, " message: ", message)
+            self.okay_msg_map[new_key] = message
+
+            return None #{"src": self.id, "dst": message.get("src"), "leader": self.id, "type": "waiting", "MID": message.get("MID") }
+    # this is for a candidate to process received votes or for the candidate to process a vote request from another candidate
+    def process_received_votes(self, message):
+        #print(f"in process_received_votes, message: {message}")
+        # another candidate is requesting a vote (so voting_for_you is not a key in the dictionary)
+        if not "voting_for_you" in message:
+            # if the term number of that candidate is greater than this node's term number, we become follower and send back
+            if message.get("term") > self.term_num:
+                self.convert_to_follower(message=message)
+
+            
+            if message.get("term") == self.term_num:
+                
+                # CHECK LOG CONDITION, 
+                if not self.isCandidateUpToDate(message=message):
+                    print(f"######## vote not granted to candidate ({message.get('src')})")
+                    return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": False }
+
+                if self.voted_for is not None and self.voted_for != message.get("src"):
+                    print(f"######## vote not granted to candidate ({message.get('src')}), we've already for {self.voted_for}")
+                    return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": False }
+                
+                # otherwise, we vote for them and set voted_for to their id
+                self.voted_for = message.get("src")
+                print(f"########## all conditions passed, voting for {message.get('src')}")
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": True }
+            
+
+            # otherwise, their term is less than ours, so don't grant vote
+            print(f"########## not voting for {message.get('src')}, their term is out of date. their term: {message.get('term')}, our term: {self.term_num}")
+            return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": False }
+        
+        # a follower has returned whether or not they want to vote for this node
+        else:
+            # if the follower did vote for this node
+            if message.get("voting_for_you"):
+                # add new vote for votes this election
+                self.num_votes_this_election += 1
+                print(f"current vote count: {self.num_votes_this_election}")
+                # if this node has received the majority required to win an election, it wins
+                if (self.num_votes_this_election >= self.num_required_for_majority()):
+                    # this node sets its state to Leader
+                    self.state = LEADER
+                    # set current leader to itself
+                    self.current_leader = self.id
+                    print("Election over, I'm the Leader")
+                    self.num_votes_this_election = 0
+                    
+                    # COMMIT RESTRICTION:
+                    # add no-op entry to log
+                    # increment current log index (this is fine since we need to start the log at 1, which takes care of 0 case - we also need to make sure not to have 
+                    # two log entries with the same index, so increment before, use it as )
+                    self.current_log_index += 1
+                    no_op_log_entry = LogEntry(log_index=self.current_log_index, term=self.term_num, command=None)
+                    self.log_entries.append(no_op_log_entry)
+
+                    for other in self.others:
+                        self.next_index.update({other: len(self.log_entries) + 1})
+                        self.match_index.update({other : 0})
+
+                    # broadcast empty append_entries
+                    append_entries = None 
+                    # if there are no entries in the log yet (first election is over), prevLogTerm and prevLogIndex are 0
+                    # NOTE - this case will never run now, since we always have a dummy entry
+                    if len(self.log_entries) == 0:
+                        # prevLogIndex and prevLogTerm don't really make sense yet, so we can broadcast empty append_entries using dst of broadcast
+                        append_entries = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "append_entries", "prevLogIndex": 0, "prevLogTerm": 0, "leaderCommit": 0, "term": self.term_num, "entries": []}
+                        # send the message (remember, we're broadcasting it)
+                        self.send(append_entries)
+                    else:
+                        # prev_log_index is the next index of that replica - 1 (since that means we've sent that particular entry already)
+                        for other in self.others:
+                            # because prevLogIndex and prevLogTerm are different for each follower, we need to make sure that they get the correct ones
+                            # here, we "broadcast" by creating the individual message for each follower and then sending it to that follower, which broadcasts the correct append_entries
+                            prev_log_index = self.next_index[other] - 1
+                            prev_log_entry = self.get_log_entry_from_log_index(prev_log_index)
+                            #print(f"&&&&&&&&&&&&&&&&&&& prev_log_entry: {prev_log_entry.to_dict()}")
+                            # TODO - change back from 0
+                            append_entries = {"src": self.id, "dst": other, "leader": self.id, "type": "append_entries", "prevLogIndex": prev_log_index, "prevLogTerm": prev_log_entry.term, "leaderCommit": self.commit_index, "term": self.term_num, "entries": []}
+                            self.send(append_entries)
+
+                    
+                    
+                    # set timer
+                    self.event_time = time.time()
+                    # select new randomized election timeout
+                    self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+
+    # This is for a follower to respond to a candidate's request to vote
+    def respond_to_request_vote_msg(self, message):
+        # if we're in a new election (and there's a term num in the received message greater than the term num in this node by consequence), 
+        # we set self.already_voted_this_term to False
+        if (message.get("type") == "request_vote"):
+            if message.get("term") > self.term_num:
+                # all updates done here
+                self.convert_to_follower(message=message)
+                self.current_leader = BROADCAST
+                # update term num to the given, since we were outdated
+                #self.term_num = message.get("term")
+                # since term num has just been updated, we have not voted this term
+                #self.already_voted_this_term = False
+            # if we've received a request vote message with a term less than the current term in this node, it's an outdated candidate,
+            # so we should not vote for it (voting_for_you = False)
+            elif message.get("term") < self.term_num:
+                return { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": False }
+
+            #else:
+                #print("Term num is the same?")
+
+            # if this node has already voted this term (either for itself or for another node),
+            # send back voting_for_you as False
+            if self.voted_for is not None or self.voted_for is not message.get("src"):
+                outgoing = { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": False }
+                #print(f"######### DID NOT vote for {message.get('src')}, msg: {outgoing}")
+                return outgoing
+            is_candidate_log_up_to_date = self.isCandidateUpToDate(message)
+            # if this node has not already voted during this term and the candidate's log is up to date, we can vote fo this candidate safely
+            if is_candidate_log_up_to_date:
+                # we've now voted for this term, so any future vote requests during this term will be denied (voting_for_you = False)
+                self.voted_for = message.get("src")
+                outgoing = { "src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "vote_response", "term": self.term_num, "voting_for_you": True }
+                # send back voting_for_you as True
+                #print(f"######### Voting for {message.get('src')}, msg: {outgoing}")
+                # reset event time, since I've voted for someone, I don't want to immediately turn into a candidate
+                self.event_time = time.time()
+                # select new randomized election timeout
+                self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+                return outgoing
+            
+    def isCandidateUpToDate(self, message):
+        # ELECTION RESTRICTION:
+        # compare logs
+        my_last_log_index = self.log_entries[-1].log_index if len(self.log_entries) > 0 else 0
+        my_last_log_term = self.log_entries[-1].term if len(self.log_entries) > 0 else 0
+        candidate_last_log_index = message.get("lastLogIndex")
+        candidate_last_log_term = message.get("lastLogTerm")
+        up_to_date = candidate_last_log_term > my_last_log_term or (candidate_last_log_term == my_last_log_term and candidate_last_log_index >= my_last_log_index)
+        print(f"isCandidateUpToDate - my_last_log_index: {my_last_log_index}, my_last_log_term: {my_last_log_term}, candidate_last_log_index: {candidate_last_log_index}, candidate_last_log_term: {candidate_last_log_term}, up to date: {up_to_date}")
+        # check if candidate log is up to date
+        return up_to_date
+    
+
+    def process_request_vote_msg(self, message):
+        # either we are getting back votes (successful or not) from followers or requests from another candidate to vote
+        if self.state == CANDIDATE:
+            output = self.process_received_votes(message)
+            #print(f"I'm a candidate, here's what i'm returning: {output}")
+            return output #self.process_received_votes(message)
+        # if we're a follower (or leader), we can only receieve requests to vote from candidates
+        else:
+        #elif self.state == FOLLOWER:
+            output = self.respond_to_request_vote_msg(message)
+            #print(f"I'm a follower, here's what i'm returning: {output}")
+            return output #self.respond_to_request_vote_msg(message)
+
+    # response to append_entries_msg from follower's side (going back to leader)
+    def respond_to_append_entries_msg(self, success, message_src):
+        message = {"src": self.id, "dst": message_src, "type": "append_entries", "leader": self.current_leader, "term": self.term_num, "success": success}
+        return message
+    
+    def get_log_entry_from_log_index(self, log_index):
+        actual_index = log_index - 1
+        if actual_index < 0 or actual_index >= len(self.log_entries):
+            return None
+        else:
+            return self.log_entries[actual_index]
+        for log_entry in self.log_entries:
+            if log_entry.log_index == log_index:
+                return log_entry
+        return None
+
+
+    def add_entries_to_follower_log(self, message):
+        log_entries_rcvd_from_leader = message.get("entries")
+        print(f"&&&&&&&&&& right before if len(log_entries_rcvd_from_leader) == 0, log_entries_rcvd_from_leader: {log_entries_rcvd_from_leader}, message from leader: {message}")
+        '''
+        if len(log_entries_rcvd_from_leader) == 0:
+            # even if size is 0, we still have to check prevLogIndex and prevLogTerm
+            if message.get("prevLogIndex") > 0:
+                log_entry_at_prev_log_index = self.get_log_entry_from_log_index(message.get("prevLogIndex"))
+
+                # Case 1: if there is no entry at prevLogIndex in this follower's log entries, return false (obvious)
+                if log_entry_at_prev_log_index is None:
+                    print(f"log entry at prevLogIndex was none, prevLogIndex: {message.get('prevLogIndex')}, log_entries: {self.log_entries}")
+                    return self.respond_to_append_entries_msg(False, message_src=message.get("src"))
+                # Case 2: there is an entry at prevLogIndex in this follower's log entries, but its term is not prevLogTerm
+                if log_entry_at_prev_log_index.term != message.get("prevLogTerm"):
+                    print(f"log entry at prevLogIndex does not have term of prevLogTerm. log_entry_at_prev_log_index.term: {log_entry_at_prev_log_index.term}, prevLogTerm: {message.get('prevLogTerm')}")
+                    return self.respond_to_append_entries_msg(False, message_src=message.get("src"))
+
+
+            print(f"number of log_entries_rcvd_from_leader is 0, so returning true (because heartbeat)")
+            return self.respond_to_append_entries_msg(True, message_src=message.get("src"))
+        '''
+
+
+        if message.get("prevLogIndex") == 0 and len(self.log_entries) == 0:
+            print("message.get('prevLogIndex') == 0 and len(self.log_entries) == 0")
+            return self.respond_to_append_entries_msg(True, message_src=message.get("src"))
+
+        # else if length is not 0, we still check the same condition
+        #if message.get("prevLogIndex") > 0:
+        log_entry_at_prev_log_index = self.get_log_entry_from_log_index(message.get("prevLogIndex"))
+
+        # Case 1: if there is no entry at prevLogIndex in this follower's log entries, return false (obvious)
+        if log_entry_at_prev_log_index is None:
+            print(f"log entry at prevLogIndex was none, prevLogIndex: {message.get('prevLogIndex')}, log_entries: {self.log_entries}")
+            return self.respond_to_append_entries_msg(False, message_src=message.get("src"))
+        # Case 2: there is an entry at prevLogIndex in this follower's log entries, but its term is not prevLogTerm
+        if log_entry_at_prev_log_index.term != message.get("prevLogTerm"):
+            print(f"log entry at prevLogIndex does not have term of prevLogTerm. log_entry_at_prev_log_index.term: {log_entry_at_prev_log_index.term}, prevLogTerm: {message.get('prevLogTerm')}")
+            return self.respond_to_append_entries_msg(False, message_src=message.get("src"))
+
+        for entry in log_entries_rcvd_from_leader:
+            # convert log entry in list from dictionary to actual LogEntry object
+            log_entry_as_object = LogEntry.from_dict(entry)
+            log_entry_as_object_log_index = log_entry_as_object.log_index
+            if self.get_log_entry_from_log_index(log_entry_as_object_log_index) is not None:
+                # this log is inconsistent with the leader's so need to get rid of elements from log_entry_as_object_log_index onwards (including log_entry_as_object_log_indexth element itself)
+                # e.g. if log_entry_as_object_log_index is 2, we want to get rid of logIndex 2 and after - thus, we do log[0:log_entry_as_object_log_index] - this will leave the entry of log index 1, which 
+                # is the consistent part
+                #print(f"&&&&&&&&&&&&& log inconsistent, deleting from following: {self.log_entries}, log_entry_as_object_log_index: {log_entry_as_object_log_index}")
+                self.log_entries = self.log_entries[:log_entry_as_object_log_index]
+                #print(f"&&&&&&&&&&&&& deletion aftermath: {self.log_entries}")
+                self.current_log_index = len(self.log_entries)
+            self.current_log_index += 1
+            # append the log entry received to our (follower's) log
+            self.log_entries.append(log_entry_as_object)
+
+    def update_indices(self, message):
+        leader_commit = message.get("leaderCommit")
+        if (leader_commit > self.commit_index):
+            # NOTE - instead of using self.current_log_index, we could use len(self.log_entries) (remember to not use - 1, since log_index is 1 based)
+            self.commit_index = min(leader_commit, self.current_log_index)
+        
+        if (self.last_applied < self.commit_index):
+            # go from last_applied + 1 to self.commit_index (both inclusive)
+            # we could use the actual 0-based list indexing python uses, but that's tough, so just check log_index and see if it's in range
+            for log_entry in self.log_entries:
+                # as soon as we hit the index past what we want to commit (if any exists), break (minor efficiency increase)
+                if (log_entry.log_index > self.commit_index):
+                    break
+                # if the log index is between self.lastApplied + 1 and self.commit_index (inclusive), then add it to our key_value pairs
+                if (log_entry.log_index >= self.last_applied + 1) and (log_entry.log_index <= self.commit_index):
+                    command = log_entry.command
+                    # COMMIT RESTRICTION: if command is not no-op, only then should we add it to the key-value pairs
+                    if command is not None:
+                        self.key_value_pairs.update(command)
+
+            self.last_applied = self.commit_index
+
+
+    def process_append_entries_msg_new(self, message):
+        if self.state == LEADER:
+            # NOTE - this must be done regardless of what message type is received
+            # placing this here deals with network partition case where this leader receives an appendEntries RPC (non-response)
+            if (self.term_num < message.get("term")):
+                self.convert_to_follower(message=message)
+                # if the term was greater but it was a success message, then don't process it
+                if "entries" not in message:
+                    self.current_leader = BROADCAST
+                    return
+                # otherwise, proper message to follower, so set current leader to source
+                self.current_leader = message.get("src")
+                # since we've converted to follower, we now process the entries as is done by followers
+                add_entries_response = self.add_entries_to_follower_log(message=message)
+                # either success is true or false, return if the log is not being added to
+                if add_entries_response is not None:
+                    return add_entries_response
+                # if add_entries_response is none, we've added to log, so update indices now
+                self.update_indices(message=message) 
+                # when this occurs, we know that we have a successful response, so return success=true
+                return self.respond_to_append_entries_msg(True, message_src=message.get("src"))
+            #print(f"&&&&&&&&&&&& key value storage: {self.key_value_pairs}")
+            # this is a response from the follower to the leader after the leader sent the append_entries to the follower
+            # check for success - if success is true, then the entry was added to that replica's log
+
+            # if the term of the given append_entries message is not greater than the leader's term, we should reject any
+            # message that involves entries or does not have the "success" key
+            if "success" not in message:
+                return 
+
+            if (message.get("success") == True):
+                # get id of the replica (follower) who sent the response to the append_entries
+                other_replica_id = message.get("src")
+                # now, let's get the next_index for the replica we just sent to
+                # at this point, this replica has added fulfilled_index to its own log (it's a next_index no longer!)
+                fulfilled_index = self.next_index[other_replica_id]
+                if (self.current_log_index < fulfilled_index):
+                    return
+                
+                #print("&&&&&&&&&& fulfilled_index: ", fulfilled_index)
+                num_committed_to_this_follower = len(self.indices_for_next_heartbeat[other_replica_id])
+                #print("&&&&&&&&&&&& num_committed_to_this_follower:", num_committed_to_this_follower, ", this follower:", other_replica_id)
+                self.next_index[other_replica_id] += num_committed_to_this_follower
+                self.match_index[other_replica_id] = self.next_index[other_replica_id] - 1
+                okay_messages_to_send = []
+                # we might have values we can commit
+                max_next_index = max(self.next_index.values()) - 1
+                if (max_next_index > self.commit_index):
+                    checking_for_majority_on_this_index = self.commit_index + 1
+                    while checking_for_majority_on_this_index <= max_next_index:
+                        # plus one for self (leader)
+                        num_added_this_index = 1
+                        for other in self.others:
+                            if num_added_this_index >= self.num_required_for_majority():
+                                # commit this entry!
+                                #print(f"############# directly above crash zone, log_entries: {[entry.to_dict() for entry in self.log_entries]}")
+                                print(f"last log index: {self.log_entries[-1].log_index}")
+                                log_entry_being_committed = self.get_log_entry_from_log_index(checking_for_majority_on_this_index)
+                                key_value_being_committed = log_entry_being_committed.command
+                                # COMMIT RESTRICTION: only no-op log entries can have a command of none, so by checking for this,
+                                # we ensure that the no-op isn't added to the key value pairs
+                                if key_value_being_committed is not None:
+                                    self.key_value_pairs.update(key_value_being_committed)
+                                    key = next(iter(key_value_being_committed))
+                                    if key in self.okay_msg_map:
+                                        okay_msg = self.okay_msg_map.pop(key)
+                                        okay_msg["src"] = self.id
+                                        okay_msg["leader"] = self.id 
+                                        okay_messages_to_send.append(okay_msg)
+                                self.commit_index += 1
+                                self.last_applied += 1
+                                break
+                                
+                            
+                            if self.match_index[other] >= checking_for_majority_on_this_index:
+                                num_added_this_index += 1
+                        checking_for_majority_on_this_index += 1
+                
+
+                for okay_msg in okay_messages_to_send:
+                    self.send(okay_msg)
+                return None
+
+                # now, we want to see how many replicas still need to log this entry (the entry at fulfilled_index)
+                fulfilled_index_count_remaining = 0
+                # look through every key-value pair in next_index
+                for other in self.next_index.keys():
+                    # if the value of next_index for that replica is fulfilled index (indicating that it is still being sent to this separate replica),
+                    # we increment fulfilled_index_count_remaining
+                    if self.next_index[other] == fulfilled_index:
+                        fulfilled_index_count_remaining += 1
+                
+                
+
+                # if the number of non-leader replicas (e.g. if there's 5 machines, there are 4 non-leader replicas plus ourselves, the leader) 
+                #plus ourselves minus the number of replicas that are still being sent the entry at the index that was just fulfilled for this message
+                # is greater than or equal to the majority of replicas minus 1 (since leader shouldn't be counted), only then 
+                # can we say that the entry has been replicated onto the majority of replicas and can thus be committed
+                if (len(self.others) + 1) - fulfilled_index_count_remaining >= self.num_required_for_majority():
+                    # get the 
+                    log_entry_being_committed = self.get_log_entry_from_log_index(fulfilled_index)
+                    key_value_being_committed = log_entry_being_committed.command
+                    first_key = next(iter(key_value_being_committed))
+                    
+                    # only the first time
+                    if not log_entry_being_committed.committed:
+                        # we have the full log entry from the message itself now, so get the log entry from message (as dict) and convert
+                        # the dict to an object of LogEntry using LogEntry.from_dict()
+                        print("committing key value pair: ", key_value_being_committed)
+                        self.key_value_pairs.update(key_value_being_committed)
+                        # now, since we've reached a majority, we can increment self.commit_index, since we've increased the index of entries
+                        # committed by 1 
+                        self.commit_index += 1
+                        self.last_applied += 1
+                        log_entry_being_committed.committed = True
+
+                    #if first_key in self.key_value_pairs:
+                        #print("Key value pair already added to key_value_pairs, key: ", first_key)
+                        #return None
+                    if not first_key in self.okay_msg_map:
+                        return None
+                    return self.okay_msg_map.pop(first_key)
+
+                    # on the next heartbeat signal, the commit_index of the leader (leaderCommit in the json) will be updated, so the follower must now figure out 
+            else:
+
+                # success was false (but not because of message term > self.termnum), update accordingly
+                # decrement nextIndex[follower] by 1
+                if self.next_index[message.get("src")] > 1:
+                    self.next_index[message.get("src")] -= 1
+                else:
+                    print("not decrementing next index")
+
+                # this is then used as the starting point for the batch of messages, so no other changes 
+                '''
+                self.state = FOLLOWER
+                self.term_num = message.get("term")
+                self.event_time = time.time()
+                self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+                '''
+                
+                
+
+        # otherwise, we're a follower (at least we should be one)
+        else:
+            # then, we should turn into follower (just in case we're a candidate still), update the term number to the one sent by the leader,
+            # and set our current_leader to the leader that just sent the heartbeat message
+            # also, set the event_time to current time, since we received heartbeat to avoid elections while leader is up (do this immediately after message received)
+
+            # check if the term sent by the leader is strictly greater than my term num - if so, only then should we reset the term num, set alreadyVoted to false
+            # and set state to follower (in case state is candidate or leader)
+            if (message.get("term") > self.term_num):
+                self.term_num = message.get("term")
+                self.voted_for = None
+                #self.state = FOLLOWER
+
+            # now, we received an AppendEntries response from a previous leader - in this case, we should decline the message completely,
+            # since whoever sent it is not valid anymore
+            if "entries" not in message:
+                return
+
+            # new stuff - check if Leader's term is less than ours
+            if message.get("term") < self.term_num:
+                # if the leader's term is less, they're bad and should be told so (through false message!)
+                print(f"leader's term is less than mine. my term: {self.term_num}, leader term: {message.get('term')}")
+                return self.respond_to_append_entries_msg(False, message_src=message.get("src"))
+            
+            # otherwise, leader is proper leader, so make sure we're follower and reset timers as such
+           
+            
+            
+
+            # otherwise, the terms are now equal, so we move along
+            # in the event that a candidate receives appendEntries from a leader where the term in the msg is greater than or equal to this candidate's term,
+            # this candidate now knows that there's a leader in this term, so it should convert to follower (not just when the term is strictly greater than)
+            self.state = FOLLOWER
+            self.current_leader = message.get("src")
+            self.event_time = time.time()
+            self.num_votes_this_election = 0
+            # select new randomized election timeout
+            self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+
+            # now, let's check the following condition:
+            # Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+            # Case 0: if the prevLogIndex of the message is 0, that means everything has just been set up and
+            # no puts have been added to the leader's log, so return true
+            # first empty append_entries
+            # if we received append entries message where no entries available (heartbeat)
+            # otherwise, this condition has been passed
+
+            # this will return a response if the log entries received is 0,
+            # or ir the prevLogIndex and prevLogTerm conditions aren't met
+            add_entries_response = self.add_entries_to_follower_log(message=message)
+            # either success is true or false, return if the log is not being added to
+            if add_entries_response is not None:
+                return add_entries_response
+            # if add_entries_response is none, we've added to log, so update indices now
+            self.update_indices(message=message) 
+            # when this occurs, we know that we have a successful response, so return success=true
+            return self.respond_to_append_entries_msg(True, message_src=message.get("src"))
+            
+
+
+
+
+            # If follower’s log does not contain an entry at prevLogIndex that matches prevLogTerm, reply NO|False to the leader.
+            # If the follower’s log contains an entry that conflicts with one in the AE message (same index, but different term), delete it and all the entries that follow.
+            
+
+            
+
+
+            
+
+
+
+
+
+            # for every log entry that the leader has sent us
+            # Append any new entries that are not already in the log
+            # get most recent (uncommitted) log entry in this follower
+            # if there are elements after that index in our log, that means our log is inconsistent with the leader's, so we get rid of everything afterwards (check paper for details, not entirely correct)
+            if message.get("prevLogIndex") == 0:
+                self.current_log_index += 1
+                # get the log entry directly from the leader's message, including all fields (remember, all entries from the leader are the correct ones)
+                new_log_entry = LogEntry.from_dict(log_entries_rcvd_from_leader)
+                self.log_entries.append(new_log_entry)
+
+                # we've added to our log, so now we need to get the leader's commit_index (meaning leaderCommit in the message we've received)
+                leader_commit = message.get("leaderCommit")
+                if (leader_commit > self.commit_index):
+                    self.commit_index = min(leader_commit, self.current_log_index)
+
+                if (self.last_applied < self.commit_index):
+                    self.last_applied += 1
+                    committing_entry = self.get_log_entry_from_log_index(self.last_applied).command
+                    self.key_value_pairs.update(committing_entry)                 
+
+                # return message to send response to leader indicating that the prevLogTerm and prevLogIndex conditions passed (and thus any new information was added)
+                return self.respond_to_append_entries_msg(True)
+            
+            #last_uncommitted_log_entry = None 
+            # if this is the first message we're receiving
+            last_uncommitted_log_entry = self.log_entries[-1]
+            # perfect case - the final uncommitted log entry in our log entries is equal to the given log index (remember that log index and term combo uniquely identify a message),
+            # then we should add the entry/entries(?) in the message from the leader to our log_entries
+            if (last_uncommitted_log_entry.log_index <= message.get("prevLogIndex")) and (last_uncommitted_log_entry.term <= message.get("prevLogTerm")):
+                #for entry in entries_rcvd_from_leader:
+                # adding new entry to our log (remember, still uncommitted)
+                # we're adding an entry to the log, so we have to first increment the log index to avoid two entries from having the same index
+                self.current_log_index += 1
+                # get the log entry directly from the leader's message, including all fields (remember, all entries from the leader are the correct ones)
+
+                new_log_entry = LogEntry.from_dict(log_entries_rcvd_from_leader)
+                self.log_entries.append(new_log_entry)
+
+                # we've added to our log, so now we need to get the leader's commit_index (meaning leaderCommit in the message we've received)
+                leader_commit = message.get("leaderCommit")
+                if (leader_commit > self.commit_index):
+                    self.commit_index = min(leader_commit, self.current_log_index)
+
+                if (self.last_applied < self.commit_index):
+                    self.last_applied += 1
+                    committing_entry = self.get_log_entry_from_log_index(self.last_applied).command
+                    self.key_value_pairs.update(committing_entry)                 
+
+                # return message to send response to leader indicating that the prevLogTerm and prevLogIndex conditions passed (and thus any new information was added)
+                return self.respond_to_append_entries_msg(True)
+
+
+
+
+
+    # on the followers' (and any potential candidates') side
+    def process_append_entries_msg(self, message):
+        if self.state == LEADER:
+            print("ERROR - LEADER SHOULD NEVER RECEIVE APPEND_ENTRIES IN OUR IMPLEMENTATION")
+            return
+        # if the term number received from the "leader" is strictly less than this follower's term num, return false back to "leader"
+        if message.get("term") < self.term_num:
+
+            # NOTE - why is the leader here message.get("src")?
+            # NOTE - should we just return append_entries with "success" as false, then the leader would see the term num and
+            # immediately become follower? (it might already be doing the latter half)
+            return { "src": self.id, "dst": message.get("src"), "leader": message.get("src"), "type": "append_entries", "term": self.term_num}
+        # the term num received from the "leader's" message is >= this term num
+        else:
+            # then, we should turn into follower (just in case we're a candidate still), update the term number to the one sent by the leader,
+            # and set our current_leader to the leader that just sent the heartbeat message
+            # also, set the event_time (so event_time) to current time, since we received heartbeat to avoid elections while leader is up
+            #print(f"Converting from {self.state} to FOLLOWER")
+            self.state = FOLLOWER
+            self.term_num = message.get("term")
+            self.current_leader = message.get("src")
+            self.event_time = time.time()
+            self.num_votes_this_election = 0
+            # select new randomized election timeout
+            self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+            #if "entries" in message and len(message.get("entries")) == 0:
+                #print(f"This is standard heartbeat (entries length is 0), received from: {self.current_leader}")
+
+        # What follower does when it gets an append message
+        # checks if the leader in the message is the same as this replica's current leader and the src of the message
+        # basically, did the replica whom I think is the leader send this message?
+        if(message.get("leader") == self.current_leader == message.get("src")):
+            # if this follower finds its own id in the cache, then append those values to the key value pairs dictionary
+            # 2PC: second phase (actually committing to key-value pair dictionary)
+            if self.id in self.cache_key_value_pairs.keys():
+                entry = self.cache_key_value_pairs.pop(self.id)
+                self.key_value_pairs.update(entry)
+                self.cache_key_value_pairs = {}
+            for other in self.others:
+                # holds the received entries in its own cache 
+                # 2PC: first phase
+                self.cache_key_value_pairs.update({other : message.get("entries")})
+            # return to leader
+            # (essentially marking success as true)
+            #return {"src": self.id, "dst": message.get("src"), "leader": self.current_leader, "type": "appended_entries", #"term": self.term_num, "entries" : message.get("entries") }
+            
+
+
+    # processes received message as either "get", "put", or "fail" type
+    def process_msg(self, message):
+       #print(f"Message in process_msg: {message}")
+        if (message.get("type") == "get"):
+            output = self.process_get_msg(message)
+            return output
+        elif (message.get("type") == "put"):
+            output = self.process_put_msg_new(message)
+            return output
+        
+        elif (message.get("type") == "request_vote" or message.get("type") == "vote_response"):
+            #print(f"++++++++++ received request_vote message: {message}")
+            output = self.process_request_vote_msg(message)
+            return output
+        
+        elif (message.get("type") == "append_entries"):
+            output = self.process_append_entries_msg_new(message)
+            return output
+
+        else:
+            print(f"Unknown message type: {message.get('type')}")
+
+    # sends request vote msgs out to all other nodes (and does other appropriate modifications)
+    def send_request_vote_msgs(self):
+        if self.state == LEADER:
+            #print("Leader cannot start new election")
+            return
+        # change state to candidate
+        self.state = CANDIDATE
+        # increment term number
+        self.term_num += 1
+        # vote for self
+        self.num_votes_this_election += 1
+        # voting for self means that we've already voted during this term, so set to true (so we don't vote for any other candidates)
+        self.voted_for = self.id
+        # ELECTION RESTRICTION:
+        # get lastLogIndex and lastLogTerm
+        last_log_index = self.log_entries[-1].log_index if len(self.log_entries) > 0 else 0
+        last_log_term = self.log_entries[-1].term if len(self.log_entries) > 0 else 0
+        # make request vote msg (include newly incremented term num)
+        request_vote_msg = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "request_vote", "term": self.term_num, "lastLogIndex": last_log_index, "lastLogTerm": last_log_term }
+        # randomly choose new election timeout
+        self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+        # restart last event time 
+        self.event_time = time.time()
+        # select new randomized election timeout
+        #self.election_timeout = random.randint(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+        #print(f"******** Sending request vote msg: {request_vote_msg}")
+        # send message
+        self.send(request_vote_msg)
+
+    # NOTE - this is only used to get the term in this leader from the log index
+    def get_log_term_by_log_index(self, log_index): 
+        for log_entry in self.log_entries:
+            if log_entry.log_index == log_index:
+                return log_entry.term
+        return None
+    
+    # sending append entries msg from the leader's side     
+    def send_append_entries_msg_from_leader(self, entries_array):
+        self.event_time = time.time()
+        append_entries_msg = None
+        if len(self.log_entries) == 0:
+            append_entries_msg = { "src": self.id, "dst": BROADCAST, "leader": self.id, "type": "append_entries", "term": self.term_num, "entries": entries_array, "prevLogIndex": 0, "prevLogTerm": self.term_num, "leaderCommit": self.commit_index }
+        elif len(self.log_entries) == 1:
+            # this is the first append entries message being sent that has actual content in it, so prevLogTerm must be set to 1 (which is self.term_num at this point in time) and prevLogIndex must be 0, since nothing has been sent prior
+            # to this message (which is the same of self.current_log_index - 1 = 1 - 1 = 0)
+            append_entries_msg = { "src": self.id, "dst": BROADCAST, "leader": self.id, "type": "append_entries", "term": self.term_num, "entries": entries_array, "prevLogIndex": self.current_log_index - 1, "prevLogTerm": self.term_num, "leaderCommit": self.commit_index }
+        else:
+            # get the prevLogTerm by getting the term of the current_log_index - 1
+            log_term = self.get_log_term_by_log_index(self.current_log_index - 1)
+            # we need to send the previous entry
+            append_entries_msg = { "src": self.id, "dst": BROADCAST, "leader": self.id, "type": "append_entries", "term": self.term_num, "entries": entries_array, "prevLogIndex": self.current_log_index - 1, "prevLogTerm": log_term, "leaderCommit": self.commit_index }
+
+
+        # for right now, we're sending it from here for simplicity's sake
+        self.send(append_entries_msg)
+        
+    # given other's id, get the batch of log entries that I need to send to it (from other's next_indexth log entry to the end of the leader's log)
+
+    def get_batch_of_entries(self, other):
+        if len(self.log_entries) == 0:
+            return []
+
+        self.indices_for_next_heartbeat[other].clear()
+        # get the next_index of other right now
+        # NOTE - if success was false previously, this has been decremented
+        other_next_index = self.next_index.get(other)
+        #print("&&&&&&&&&&&&&&&&& other_next_index:", other_next_index, ", other:", other)
+        other_next_index_as_list_index = other_next_index - 1
+        # batch of entries being sent to this other id (follower)
+        batch_of_entries = []
+        # does the specified next_indexth log entry exist in my list of log entries
+        # NOTE - other_next_index_as_list_index will convert from the other next_index (which is 1 based) to a 0 based index
+        # so we can get access to the next_indexth log from the list without having to check the log entry num
+        if 0 <= other_next_index_as_list_index < len(self.log_entries):
+            # if what's remaining in the log (starting from next_index) is less than MAX_MESSAGES_PER_BATCH, send log[next_index, end] to the follower
+            # if what's remaining in the log (starting from next_index) is greater than MAX_MESSAGES_PER_BATCH, send log[next_index, next_index + MAX_MESSAGES_PER_BATCH] to follower
+            for log_entry in self.log_entries[other_next_index_as_list_index : ]:
+                # if we've hit the max number of messages per batch, we can't add any more to the batch (which is fine!)
+                if len(batch_of_entries) >= MAX_MESSAGES_PER_BATCH:
+                    break
+                batch_of_entries.append(log_entry.to_dict())
+                # NOTE - we want to take care of the case where the leader sends out 2, 3, 4 to replica, but before the replica sends back
+                # success, the leader receives a put and adds it to the log (index 5) and then once the replica sends back its true message, 
+                # we want next_index for that replica to be updated to 5, not 6, since we haven't sent it yet - thus, we need to store the indices we're sending
+                # on each append_entries in indices_for_next_heartbeat at the key "other"
+                self.indices_for_next_heartbeat[other].append(log_entry.log_index)
+        return batch_of_entries
+
+
+
+
+    def run(self):
+        self.event_time = time.time()
+        while True:
+            # check if any data is available on the socket
+            ready_socket = select.select([self.socket], [], [], SOCKET_TIMEOUT / 1000.0)[0]
+            # if there is (select.select() returned non-empty list)
+            if (len(ready_socket) > 0):
+                data, addr = self.socket.recvfrom(65535)
+                msg = json.loads(data.decode('utf-8'))
+                print("Received message '%s'" % (msg,), flush=True)
+                response = self.process_msg(msg)
+                if response is not None:
+                    print("sending:", response)
+                    self.send(response)
+
+            
+            # election timeout has been surpassed
+            current_elapsed_time = time.time() - self.event_time
+
+
+            if self.state == LEADER:
+                if current_elapsed_time > self.heartbeat_timeout:
+                    # send heartbeats now - however, loop over every destination (follower) and send it the entries from next_index to the end of the log!
+                    # NOTE - not sure what the time difference between this and broadcast is, but sending individually is definitely better option, since
+                    # we need to make sure that the batch of entries starts from correct index for each follower we're sending to
+                    for other in self.others:
+                        # get batch of entries for this particular follower
+                        batch_of_entries = self.get_batch_of_entries(other)
+                        print(f"Sending following batch of entries: {batch_of_entries}")
+                        #print("&&&&&&&&&&&&&& batch_of_entries:", batch_of_entries, ", other: ", other)
+                        # prevlogindex can be calculated by getting the index before the one indicating the new entry(potentially entries) being sent in this message (which is what next_index is)
+                        prev_log_index = self.next_index.get(other) - 1
+                        prev_log_term = self.get_log_term_by_log_index(prev_log_index)
+                        # now that we have the prevlogindex, we get the term associated with that index using the method shown
+                        if (prev_log_index == 0):
+                            prev_log_term = 0
+                        
+                        # create message   
+                        #print(f"in run, prev_log_index: {prev_log_index}")
+                        #print(f"in run, prevLogTerm: {prev_log_term}")
+                        message = {"src": self.id, "dst": other, "type": "append_entries", "leader": self.id, "term": self.term_num, "entries": batch_of_entries, "leaderCommit": self.commit_index, "prevLogIndex": prev_log_index, "prevLogTerm": prev_log_term}
+                        # send message
+                        self.send(message)
+                    # now that all append_entries have been sent, we reset timer
+                    self.event_time = time.time()
+
+            elif self.state == CANDIDATE or self.state == FOLLOWER:
+                if (current_elapsed_time > self.election_timeout):
+                    print(f"************** Election timeout surpassed, starting election, elapsed time: {current_elapsed_time}, election timeout: {self.election_timeout}")
+                    # broadcast request vote msg from this node
+                    self.current_leader = BROADCAST
+                    # reset vote counter
+                    self.num_votes_this_election = 0
+                    self.send_request_vote_msgs()
+            '''
+            if self.state == LEADER:
+                if current_elapsed_time > self.heartbeat_timeout:
+                    # send heartbeats if there's nothing in the leader's cache
+                    if self.cache_key_value_pairs == {}:
+                        self.send_append_entries_msg_from_leader({})
+                    # otherwise, there's stuff in the leader's cache
+                    else:
+                        self.event_time = time.time()
+                        # loop through the replicas (followers)
+                        #send a message to append entries with heartbeat
+                        for other in self.others:
+                            # if they're in the leader's cache, send these entries along with the heartbeat message (actual sending)
+                            if other in self.cache_key_value_pairs.keys():
+                                append_entries_msg = {"src": self.id, "dst": BROADCAST, "leader": self.id, "type": "append_entries",
+                                            "term": self.term_num, "entries": self.cache_key_value_pairs[other]}
+                                self.send(append_entries_msg)
+                            # otherwise, this particular replica has nothing new to cache, so send heartbeat (so no new entries)
+                            else:
+                                append_entries_msg = {"src": self.id, "dst": BROADCAST, "leader": self.id,
+                                                      "type": "append_entries",
+                                                      "term": self.term_num,
+                                                      "entries": []}
+                                self.send(append_entries_msg)
+            '''
+
+            
+
+    # leader processing responses from followers saying that they appended certain entries
+    def process_appended_entries_msg(self, message):
+        # NOTE - not the issue
+        if self.state != LEADER:
+            print("ERROR - NON-LEADER RECEIVED APPENDED_ENTRIES MESSAGE!!!!!!!!!!!!!")
+            return
+        # get src of message
+        src = message.get("src")
+        # get dictionary of entries to stop sending (messages that the follower has added to its own cache) 
+        remove_entries:dict = message.get("entries")
+        # if remove entries is not empty
+        # NOTE - this was changed from if remove_entries != []
+        if remove_entries != {}:
+            # remove it from the cache as the replic has added it
+            # check if the given src (some follower) is in the cache for the leader
+            if src in self.cache_key_value_pairs.keys():
+                # if so, get the values for that specific follower from the cache
+                entries:dict = self.cache_key_value_pairs.pop(src)
+                # if there is at least one entry in our (leader's) cache for this follower
+                if entries is not None:
+                    # loop through all the keys we want to remove 
+                    # (e.g. replica 1 added some entry A to his cache, he reported back to the leader that that was the case,
+                    # so now the leader knows to send entry A to replica 1 again, which is why he's removing entry A from his cache at the key
+                    # "replica 1")
+                    # NOTE - this was changed from for entry_key in remove_entries
+                    for entry_key in remove_entries.keys():
+                        # pop those keys from our cache
+                        if entry_key in entries.keys():
+                            entries.pop(entry_key)
+                    # now that we've gotten rid of entry A, let's say we still want replica 1 to commit entries B and C,
+                    # this will add back B and C at replica 1, but A is now gone (since it's been cached in replica 1)
+                    if len(entries) > 0:
+                        self.cache_key_value_pairs.update({src: entries})
+            # needed if majority have added so it can be removed from others
+            removeFromCache = False
+            
+            # for every key in the entries we want to remove from being sent to this replica again (since they've already been cached at that replica)
+            # ERROR - python thinks 
+            for entry_key in remove_entries.keys():
+                # counter for how many replicas have added this particular entry
+                others_have_added = 0
+                # goes through the dict to find the key value pair to see if majority has been hit
+                for other in self.cache_key_value_pairs.keys():
+                    # gets the key-value pairs that we still send to replica "other"
+                    mapping = self.cache_key_value_pairs.get(other)
+                    print("This is the values from the list:", mapping)
+                    # if this key value pair is not none
+                    if mapping is not None:
+                            # if the entry_key is not in the key-value pairs that still need to be sent to this replica
+                            if entry_key not in mapping.keys():
+                                # in this case, that means this replica has added it to their cache, so increment counter
+                                others_have_added += 1
+                                print("not in values: ", others_have_added)
+                            # if we hit majority append, send okay and break
+                            if others_have_added >= self.num_required_for_majority():
+                                # now that we have majority, commit the specific remove_entry (the key-value pair that was just removed from 
+                                # NOTE - we don't want to add all of them
+                                # NOTE - ERROR APPARENTLY - right now it's adding all of the remove entries, when we only want to add one of them (entry_key and its value)
+                                self.key_value_pairs.update({entry_key: remove_entries.get(entry_key)})
+                                # fixed print
+                                print("Entry added: ", {entry_key: remove_entries.get(entry_key)})
+                                # if we haven't already sent out the okay message for this particular key value pair
+                                if entry_key in self.okay_msg_map.keys():
+                                    # send it (and remove it from the okay map, so that the client doesn't get multiple okays for the same thing)
+                                    message = self.okay_msg_map.pop(entry_key)
+                                    print("sending: ", message)
+                                    print("rest of okaymap: ", self.okay_msg_map)
+                                    self.send(message)
+                                # set check to true, indicating that majority has cached (and now committed)
+                                removeFromCache = True
+                    # if the majority has cached
+                    if removeFromCache:
+                        # for every replica (follower)
+                        for other in self.cache_key_value_pairs.keys():
+                            # get the key_value pairs being sent to this replica by the leader currently
+                            mapping = self.cache_key_value_pairs.get(other)
+                            # for every entry that has now received this entry_key, we can remove it from the cache (send-list)
+                            # of the leader, since the leader no longer needs to send it to this particular follower
+                            for entry_key in remove_entries.keys():
+                                if entry_key in mapping:
+                                    mapping.pop(entry_key)
+                        # at this point, we've already removed this key-value pair from the cache of the leader, so break
+                        break
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
